@@ -25,9 +25,12 @@ def gamma_inc_2(x):
     # return gamma_inc_1(x) - x * np.exp(-x)
 
 def gain_srwf(xi, gamma):
+    # (Also called Spectral Subtraction gain)
+    # Boll, S. Suppression of acoustic noise in speech using spectral subtraction. 
     return np.sqrt(xi / (1 + xi))
 
-def gain_wiener(xi, gamma):
+def gain_mmse(xi, gamma):
+    # Y. Ephraim, D. Malah, Speech enhancement using a minimum mean-square error short-time spectral amplitude estimator.
     return xi / (1 + xi)
 
 def gain_stsa(xi, gamma):
@@ -94,23 +97,21 @@ class NoiseEstMMSEUnbiased:
     PDF: http://cas.et.tudelft.nl/pubs/gerkmann_unbiasedMMSE_TASL2012.pdf
     Improves on NoiseEstimator (Hendriks et al, 2010)
     '''
-    def __init__(self):
-        self.var_nse = 1e-5
-        self.beta = 0.8
-        p_h1 = 0.7
-        xi_h1_db = 15 # dB SNR (power ratio)
+    def __init__(self, var_nse=1e-4, beta=0.8, p_h1=0.6, xi_h1_db=15):
+        self.var_nse = var_nse
+        self.beta = beta
         self.p_h0_over_h1 = (1 - p_h1) / p_h1
-        self.xi_h1 = np.power(10, xi_h1_db / 10) 
+        self.xi_h1 = np.power(10, xi_h1_db / 10) # SNR (power ratio)
 
     def estimate(self, Y_psd, X_psd=None):
         zeta = Y_psd / self.var_nse # A posteriori SNR
 
         p_h1_y = 1 / (1 + self.p_h0_over_h1 * (1 + self.xi_h1) * np.exp(-zeta * self.xi_h1 / (1 + self.xi_h1)))
-        p_h1_y = np.minimum(p_h1_y, 0.99)
+        p_h1_y = np.minimum(p_h1_y, 0.99999)
 
         var_nse = Y_psd * (1 - p_h1_y) + self.var_nse * p_h1_y # E(|N|^2 | y)
 
-        # var_nse = spsig.convolve(var_nse, [0.1, 0.2, 0.4, 0.2, 0.1], mode='same')
+        var_nse = spsig.convolve(var_nse, [0.1, 0.2, 0.4, 0.2, 0.1], mode='same')
         self.var_nse = self.beta * self.var_nse + (1 - self.beta) * var_nse
         return self.var_nse
 
@@ -153,32 +154,36 @@ class NoiseEstRegStat:
 
 def denoise(Y, gain=gain_lsa):
     N_bins = Y.shape[0]
-    noise_est = NoiseEstMMSEUnbiased()
-    alpha = 0.98
-    xi_min = 0.01
-    p_h1 = 0.8      # Probability of speech
+    one_minus_alpha = 0.012 # Higher numbers lead to 'bubbling/musical' artifacts
+    xi_min_db = -27
+    G_min_db = -27  # Amplitude gain for H0 (no speech)
+    p_h1 = 0.5      # Apriori probability of speech (high numbers tend to mix noise with speech)
     # p_h1 = np.array([0.8] * 100 + [0.4] * (N_bins - 100))
-    G_min_db = -20  # -25 dB amplitude gain
-    p_h0_over_h1 = (1 - p_h1) / p_h1
+
+    alpha = 1 - one_minus_alpha
+    xi_min = np.power(10, xi_min_db / 10)
     G_min = np.power(10, G_min_db / 20)
+    p_h0_over_h1 = (1 - p_h1) / p_h1
+
+    noise_est = NoiseEstMMSEUnbiased(p_h1=p_h1, xi_h1_db=12)
 
     X = []
     W = []
     # X_psd = np.zeros(N_bins)
     xi_h1 = xi_min
     for Y_l in Y.transpose():
-        Y_psd = np.abs(Y_l)**2
+        Y_psd = np.abs(Y_l)**2                  # Power spectrum density
         lambda_nse = noise_est.estimate(Y_psd)  # Variance of noise
-        zeta = Y_psd / lambda_nse       # A posteriori SNR
+        zeta = Y_psd / lambda_nse               # A posteriori SNR (power ratio)
 
         # Estimate a-priori SNR via DD approach
         # xi = np.maximum(xi_min, alpha * X_psd / lambda_nse + (1 - alpha) * np.maximum(zeta - 1, 0))
         xi = np.maximum(xi_min, alpha * xi_h1 + (1 - alpha) * np.maximum(zeta - 1, 0))
 
+        # OMLSA equation from Cohen, I.; Berdugo, B. Speech enhancement for non-stationary noise environments.
         # Estimate speech probability
         p_h1_y = 1 / (1 + p_h0_over_h1 * (1 + xi) * np.exp(-zeta * xi / (1 + xi)))
-        p_h1_y = spsig.convolve(p_h1_y, [0.2, 0.6, 0.2], mode='same')
-        # p_h1_y = 1
+        # p_h1_y = spsig.convolve(p_h1_y, [0.2, 0.6, 0.2], mode='same')
 
         # Calculate gain
         G_H1 = gain(xi, zeta)
@@ -199,19 +204,22 @@ parser = argparse.ArgumentParser()
 parser.add_argument("input_file")
 parser.add_argument("--plot", action="store_true")
 parser.add_argument("--play", action="store_true")
+parser.add_argument("--noise", type=float)
 parser.add_argument("--save")
 args = parser.parse_args()
 
 fs, sig = spwav.read(args.input_file)
-sig = sig / 32768.0 + 1e-6
+sig = sig / 32768.0
 # sig = np.ones(len(sig))
 print(f'Read {len(sig)} samples at {fs} Hz rate (min/max={np.min(sig)}/{np.max(sig)})', file=sys.stderr)
 
+if args.noise:
+    sig += np.random.normal(scale=args.noise, size=sig.shape)
+
 win_size = int(0.032 * fs + 0.5)
-# win_size = 512
 win_shift = win_size // 2
-nfft = max(win_size, 512)
-print(f'Using window size of {win_size} samples')
+nfft = max(win_size, 256)
+print(f'Window size: {win_size}, FFT size: {nfft}')
 win = spsig.get_window('hamming', win_size)
 _, _, H = spsig.stft(sig, fs=fs, window=win, nperseg=win_size, noverlap=(win_size - win_shift), nfft=nfft)
 print(f'STFT size: {H.shape} min/max={lin2db(np.min(np.abs(H)))}/{lin2db(np.max(np.abs(H)))} dB')
@@ -233,23 +241,23 @@ if args.play:
 if args.plot:
     import matplotlib.pyplot as plt
 
-    plt.figure()
+    # plt.figure()
+    # # x_db = np.linspace(-20, 20, 100)
+    # # zeta = 1 + np.power(10, x_db/10)
+    # # for xi_db in [20, 15, 5, 0, -5, -10, -15, -20]:
+    # #     xi = np.power(10, xi_db / 10)
+    # #     y1 = gain_lsa(xi, zeta)
+    # #     plt.plot(x_db, lin2db(y1))
+    # #     y2 = gain_stsa(xi, zeta)
+    # #     plt.plot(x_db, lin2db(y2), '--')
+    # # plt.ylim([-35, 5])
     # x_db = np.linspace(-20, 20, 100)
-    # zeta = 1 + np.power(10, x_db/10)
-    # for xi_db in [20, 15, 5, 0, -5, -10, -15, -20]:
-    #     xi = np.power(10, xi_db / 10)
-    #     y1 = gain_lsa(xi, zeta)
-    #     plt.plot(x_db, lin2db(y1))
-    #     y2 = gain_stsa(xi, zeta)
-    #     plt.plot(x_db, lin2db(y2), '--')
-    # plt.ylim([-35, 5])
-    x_db = np.linspace(-20, 20, 100)
-    xi = np.power(10, x_db/10)
-    for zeta_db in [-15, -7, 0, 7, 15]:
-        zeta = np.power(10, zeta_db / 10)
-        y = gain_lap(xi, zeta)
-        plt.plot(x_db, lin2db(y))
-    plt.grid()
+    # xi = np.power(10, x_db/10)
+    # for zeta_db in [-15, -7, 0, 7, 15]:
+    #     zeta = np.power(10, zeta_db / 10)
+    #     y = gain_lap(xi, zeta)
+    #     plt.plot(x_db, lin2db(y))
+    # plt.grid()
 
     plt.figure()
     plt.subplot(311)
